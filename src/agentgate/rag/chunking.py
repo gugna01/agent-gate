@@ -30,7 +30,7 @@ class Chunk:
 
     @property
     def chunk_id(self) -> str:
-        return f"{'$'}{'{'}self.doc_id}#{'$'}{'{'}self.index}"
+        return f"{self.doc_id}#{self.index}"
 
     def preview(self, width: int = 90) -> str:
         flat = re.sub(r"\s+", " ", self.text).strip()
@@ -48,9 +48,9 @@ def chunk_document(
     target_chars: int = 500,
     overlap_sentences: int = 1,
 ) -> list[Chunk]:
-    """Split into chunks of roughly \u0060\u0060target_chars\u0060\u0060, never mid-sentence.
+    """Split into chunks of roughly ``target_chars``, never mid-sentence.
 
-    \u0060\u0060overlap_sentences\u0060\u0060 repeats the tail of each chunk at the head of the
+    ``overlap_sentences`` repeats the tail of each chunk at the head of the
     next one. Overlap costs storage and buys recall: a fact that straddles a
     boundary would otherwise be retrievable from neither side. One sentence
     is usually enough — more starts returning near-duplicate chunks, which
