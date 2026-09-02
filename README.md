@@ -8,8 +8,9 @@ categoría coherente, una cifra razonable. Ningún `try/except` detecta eso. Se
 escribe en la base de datos, se ve normal, y contamina todo lo que venga
 después.
 
-Este repositorio implementa la respuesta: **una compuerta por la que pasa todo
-registro, con tres salidas y ningún atajo.**
+Este repositorio implementa la respuesta en dos frentes: **una compuerta por la
+que pasa todo registro, con tres salidas y ningún atajo** — y, sobre ella, un
+sistema **RAG** que aplica la misma idea a las respuestas generadas.
 
 ```
 extraer  ->  normalizar  ->  COMPUERTA  ->  aceptado
@@ -49,7 +50,7 @@ la base de datos en silencio.
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests -q      # 27 tests
+python -m pytest tests -q      # 61 tests
 ```
 
 ## Las cuatro decisiones
@@ -152,12 +153,154 @@ src/agentgate/
   queue.py        cola de revisión humana
   pipeline.py     orquestación, deliberadamente delgada
 examples/         demo ejecutable
-tests/            27 tests
+tests/            61 tests
 ```
 
 El pipeline no escribe en ningún almacén. Devuelve un informe y quien lo llama
 decide. Eso lo hace probable sin base de datos y deja los efectos secundarios
 a la vista.
+
+---
+
+# RAG con verificación de respaldo
+
+`agentgate.rag` extiende la misma idea a preguntas y respuestas. La
+recuperación decide **qué lee el modelo**; la compuerta decide **si lo que dijo
+se puede rastrear hasta ahí**. Hacen falta las dos: un modelo con el contexto
+correcto sigue pudiendo agregar una frase que no aparece en él.
+
+```bash
+python examples/run_rag_demo.py
+```
+
+```
+P: ¿Qué cubre la garantía y cómo la activo?
+[   review] groundedness 0.63 — 1 of 3 sentence(s) unsupported — the rest stands
+  sources: garantia#0
+  R: La garantía cubre defectos de fabricación durante doce meses desde la fecha de
+     compra. Para activarla se requiere la factura de compra. Además, la garantía
+     puede extenderse veinticuatro meses adicionales pagando una prima equivalente
+     al quince por ciento del valor del producto. [garantia#0]
+  ⚠ sin respaldo en el corpus: Además, la garantía puede extenderse veinticuatro
+     meses adicionales pagando una prima equivalente al quince por ciento…
+```
+
+Dos frases correctas y una tercera **fluida, específica y falsa**. Está bien
+escrita, suena a política de empresa y no aparece en ningún documento. Eso es
+lo que hay que detectar, y se detecta frase por frase.
+
+## Las decisiones
+
+### Dónde se corta importa más que el tamaño
+
+Un fragmento que termina a mitad de frase, o que separa una tabla de su
+encabezado, recupera mal por bueno que sea el modelo de embeddings: el
+significado se destruyó antes de que el modelo lo viera. El divisor respeta
+párrafos primero, frases después, y prefiere pasarse del tamaño objetivo antes
+que partir una frase.
+
+El solapamiento de una frase entre fragmentos cuesta almacenamiento y compra
+recuperación: un dato que cae justo en el borde no sería recuperable desde
+ninguno de los dos lados.
+
+### La morfología del español rompe el emparejamiento por palabras
+
+Esto no fue una decisión de diseño: fue un fallo que encontró el demo.
+
+La primera versión indexaba palabras. La pregunta *"¿Cuántos días tengo para
+devolver un producto?"* recuperaba la **política de envíos** — porque ambas
+mencionan "días" y ninguna comparte "devolver" con "devoluciones".
+
+`devolver`, `devolución` y `devoluciones` son tres tokens distintos que no se
+solapan en nada. La solución estándar son los n-gramas de caracteres: les da un
+núcleo común (`devol`, `evolu`) y el emparejamiento sobrevive a la flexión.
+Pesan menos que las palabras completas, porque a peso igual dos palabras largas
+sin relación que comparten un fragmento empiezan a ganarle a una coincidencia
+exacta.
+
+```python
+def test_char_ngrams_bridge_spanish_morphology(self):
+    """The bug the demo exposed: 'devolver' must reach 'devoluciones'."""
+    shared = set(char_ngrams("devolver")) & set(char_ngrams("devoluciones"))
+    assert shared
+```
+
+### Si no hay con qué responder, no se llama al modelo
+
+```python
+if retrieval.verdict is RetrievalVerdict.INSUFFICIENT:
+    return Answer(verdict=AnswerVerdict.REFUSED, ...)
+```
+
+Rechazar antes de llamar al modelo no solo es más seguro, es más barato. La
+mayoría de los sistemas RAG descubre esto en su primera factura.
+
+### Una cita que no se validó es decoración
+
+Un modelo cita con total naturalidad un identificador que nunca vio. Las citas
+se contrastan contra los fragmentos realmente recuperados; las inventadas se
+descartan, y una respuesta sin cita válida no se entrega como respuesta: nadie
+puede comprobarla.
+
+### Rechazar solo cuando no queda nada rescatable
+
+Enrutar por el promedio de la puntuación tira a la basura lo más útil que
+produjo la verificación: **saber cuáles frases fallaron.** Una respuesta con
+tres frases buenas y una inventada promedia hacia el rechazo, y se descarta una
+respuesta correcta porque una cláusula era falsa — cuando un revisor
+simplemente borraría esa cláusula.
+
+Así que el rechazo se reserva para respuestas sin nada que salvar. Si alguna
+frase se sostiene, decide una persona.
+
+Este también salió de un test: esperaba revisión y recibió rechazo.
+
+## Sobre la medida, sin exagerarla
+
+La verificación de respaldo se calcula por **solapamiento léxico** entre cada
+frase de la respuesta y los fragmentos recuperados, contando solo palabras con
+contenido.
+
+Detecta con fiabilidad el fallo común —el modelo inventa un nombre, una cifra o
+una regla que no está en la fuente—. **No** detecta una paráfrasis fiel marcada
+como no respaldada, ni una frase que reutiliza el vocabulario de la fuente
+invirtiendo su sentido.
+
+Un sistema en producción reemplaza esa función por un modelo NLI o un LLM como
+juez, y no cambia nada a su alrededor. **La interfaz es lo que importa; la
+medida es intercambiable.**
+
+Lo mismo aplica a `HashingEmbedder`: es determinista y sin dependencias, que es
+lo que hace este repositorio ejecutable por cualquiera sin clave de API. El
+propio demo termina mostrando dónde se rompe:
+
+```
+LÍMITE CONOCIDO — recuperación léxica, misma pregunta en otras palabras
+
+P: ¿En cuánto tiempo llega un pedido a una ciudad principal?
+   politica-devoluciones#0  0.286
+   envios#0                 0.273
+```
+
+La respuesta está en `envios#0`, pero la pregunta no comparte ni una palabra de
+contenido con ella. Eso no se arregla ajustando umbrales: se cambia
+`HashingEmbedder` por un modelo real de embeddings, que es para lo que existe
+`ModelEmbedder`.
+
+Prefiero mostrar el límite a que lo encuentre quien evalúe el código.
+
+## Estructura
+
+```
+src/agentgate/rag/
+  chunking.py     división que respeta párrafos y frases, con solapamiento
+  embedding.py    hashing determinista con n-gramas de caracteres, y adaptador a modelo real
+  index.py        índice vectorial y búsqueda por coseno
+  retrieval.py    piso de puntuación: cuándo el corpus no alcanza
+  answering.py    respuesta, verificación de respaldo y validación de citas
+```
+
+---
 
 ## Por qué existe este repositorio
 
